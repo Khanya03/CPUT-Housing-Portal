@@ -1,4 +1,11 @@
 require('dotenv').config();
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (typeof JWT_SECRET !== 'string' || JWT_SECRET.trim() === '') {
+    console.error('Fatal: JWT_SECRET environment variable is required and must not be empty. Set JWT_SECRET before starting the server.');
+    process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -44,7 +51,7 @@ const verifyToken = (req, res, next) => {
     }
     const token = authHeader.split(' ')[1];
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret-key-change-me');
+        const decoded = jwt.verify(token, JWT_SECRET);
         req.user = decoded;
         next();
     } catch (error) {
@@ -124,7 +131,7 @@ app.post('/api/auth/login', async (req, res) => {
 
         const token = jwt.sign(
             { id: user.id, email: user.email, role: user.role },
-            process.env.JWT_SECRET || 'fallback-secret-key-change-me',
+            JWT_SECRET,
             { expiresIn: '7d' }
         );
 
@@ -173,7 +180,7 @@ app.post('/api/auth/register', async (req, res) => {
         const user = newUser.rows[0];
         const token = jwt.sign(
             { id: user.id, email: user.email, role: 'student' },
-            process.env.JWT_SECRET || 'fallback-secret-key-change-me',
+            JWT_SECRET,
             { expiresIn: '7d' }
         );
 
