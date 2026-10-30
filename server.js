@@ -85,29 +85,54 @@ const upload = multer({
     fileFilter
 });
 
-// ---------- JWT MIDDLEWARE ----------
-const verifyToken = (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Access denied. No token provided.' });
-    }
-    const token = authHeader.split(' ')[1];
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch (error) {
-        return res.status(403).json({ error: 'Invalid or expired token.' });
-    }
-};
+// ---------- AUTH HELPERS ----------
+const PASSWORD_MIN_LENGTH = 8;
+// bcrypt only uses the first 72 bytes and throws past that.
+const PASSWORD_MAX_BYTES = 72;
+const STUDENT_EMAIL_SUFFIX = '@mycput.ac.za';
+// Used when login finds no account so the response time does not reveal that.
+const DUMMY_PASSWORD_HASH = '$2b$10$7tT60wbt1vRIAkbPYWjOn.2u7ZMNwO8ijUXRFioqYlhjNXRXzQEYW';
 
-// ---------- STAFF MIDDLEWARE ----------
-const verifyStaff = (req, res, next) => {
-    if (req.user.role !== 'staff') {
-        return res.status(403).json({ error: 'Access denied. Staff privileges required.' });
+function normalizeEmail(email) {
+    if (typeof email !== 'string') return null;
+    const normalized = email.trim().toLowerCase();
+    if (!normalized || normalized.length > 254 || /\s/.test(normalized)) return null;
+    return normalized;
+}
+
+function isCputStudentEmail(email) {
+    return email.endsWith(STUDENT_EMAIL_SUFFIX)
+        && email.length > STUDENT_EMAIL_SUFFIX.length
+        && !email.slice(0, -STUDENT_EMAIL_SUFFIX.length).includes('@');
+}
+
+function parseUserId(value) {
+    if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value;
+    if (typeof value === 'string' && /^[1-9]\d{0,18}$/.test(value)) return value;
+    return null;
+}
+
+function extractBearerToken(authorization) {
+    if (authorization == null || (typeof authorization === 'string' && authorization.trim() === '')) {
+        return { ok: false, error: 'Access denied. No token provided.' };
     }
-    next();
-};
+    if (typeof authorization !== 'string') {
+        return { ok: false, error: 'Access denied. Invalid Authorization header.' };
+    }
+    const match = authorization.trim().match(/^Bearer\s+(\S+)$/i);
+    if (!match) {
+        return { ok: false, error: 'Access denied. Invalid Authorization header.' };
+    }
+    return { ok: true, token: match[1] };
+}
+
+function signAuthToken(user) {
+    return jwt.sign(
+        { id: user.id, email: user.email, role: user.role },
+        JWT_SECRET,
+        { expiresIn: '7d', algorithm: 'HS256' }
+    );
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -123,6 +148,66 @@ const pool = new Pool({
     password: process.env.DB_PASSWORD || 'postgres',
     port: process.env.DB_PORT || 5432,
 });
+
+// req.user is loaded from the users table after the JWT signature and expiry check.
+const verifyToken = async (req, res, next) => {
+    const extracted = extractBearerToken(req.headers.authorization);
+    if (!extracted.ok) {
+        return res.status(401).json({ error: extracted.error });
+    }
+
+    let decoded;
+    try {
+        decoded = jwt.verify(extracted.token, JWT_SECRET, { algorithms: ['HS256'] });
+    } catch (error) {
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Token expired.' });
+        }
+        return res.status(401).json({ error: 'Invalid token.' });
+    }
+
+    const userId = parseUserId(decoded && decoded.id);
+    const tokenRole = decoded && decoded.role;
+    if (!userId || (tokenRole !== 'student' && tokenRole !== 'staff') || typeof decoded.exp !== 'number') {
+        return res.status(401).json({ error: 'Invalid token.' });
+    }
+    if (typeof decoded.email !== 'string') {
+        return res.status(401).json({ error: 'Invalid token.' });
+    }
+
+    try {
+        const result = await pool.query(
+            'SELECT id, email, role FROM users WHERE id = $1',
+            [userId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Access denied. User no longer exists.' });
+        }
+        const user = result.rows[0];
+        if (user.role !== tokenRole || String(user.email).toLowerCase() !== decoded.email.toLowerCase()) {
+            return res.status(401).json({ error: 'Invalid token. Account no longer matches this token.' });
+        }
+        req.user = { id: user.id, email: user.email, role: user.role };
+        return next();
+    } catch (error) {
+        console.error('Auth error:', error);
+        return res.status(500).json({ error: 'Internal server error.' });
+    }
+};
+
+const verifyStaff = (req, res, next) => {
+    if (!req.user || req.user.role !== 'staff') {
+        return res.status(403).json({ error: 'Access denied. Staff privileges required.' });
+    }
+    next();
+};
+
+const verifyStudent = (req, res, next) => {
+    if (!req.user || req.user.role !== 'student') {
+        return res.status(403).json({ error: 'Access denied. Student privileges required.' });
+    }
+    next();
+};
 
 // ---------- TEST ENDPOINT ----------
 app.get('/api/test-db', async (req, res) => {
@@ -149,33 +234,34 @@ app.get('/api/users', async (req, res) => {
 // ---------- LOGIN (NEW) ----------
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const body = req.body || {};
+        const email = normalizeEmail(body.email);
+        const password = body.password;
 
-        if (!email || !password) {
+        if (!email || typeof password !== 'string' || password.length === 0) {
             return res.status(400).json({ error: 'Email and password are required.' });
         }
 
+        if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_BYTES) {
+            return res.status(401).json({ error: 'Invalid email or password.' });
+        }
+
         const userResult = await pool.query(
-            'SELECT id, email, password_hash, full_name, role FROM users WHERE email = $1',
+            'SELECT id, email, password_hash, full_name, role FROM users WHERE lower(email) = $1',
             [email]
         );
 
-        if (userResult.rows.length === 0) {
+        const user = userResult.rows.length === 1 ? userResult.rows[0] : null;
+
+        const hash = user && typeof user.password_hash === 'string' && user.password_hash
+            ? user.password_hash
+            : DUMMY_PASSWORD_HASH;
+        const validPassword = await bcrypt.compare(password, hash);
+        if (!user || !validPassword) {
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
 
-        const user = userResult.rows[0];
-
-        const validPassword = await bcrypt.compare(password, user.password_hash);
-        if (!validPassword) {
-            return res.status(401).json({ error: 'Invalid email or password.' });
-        }
-
-        const token = jwt.sign(
-            { id: user.id, email: user.email, role: user.role },
-            JWT_SECRET,
-            { expiresIn: '7d' }
-        );
+        const token = signAuthToken(user);
 
         res.json({
             message: 'Login successful!',
@@ -197,16 +283,26 @@ app.post('/api/auth/login', async (req, res) => {
 // ---------- STEP 1: REGISTER ----------
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { email, password, full_name, student_number } = req.body;
+        const body = req.body || {};
+        const email = normalizeEmail(body.email);
+        const password = body.password;
+        const fullName = typeof body.full_name === 'string' ? body.full_name.trim() : '';
+        const studentNumber = typeof body.student_number === 'string' ? body.student_number.trim() : '';
 
-        if (!email || !email.endsWith('@mycput.ac.za')) {
+        if (!email || !isCputStudentEmail(email)) {
             return res.status(400).json({ error: 'Only @mycput.ac.za emails allowed.' });
         }
-        if (!password || !full_name || !student_number) {
+        if (typeof password !== 'string' || password.length === 0 || !fullName || !studentNumber) {
             return res.status(400).json({ error: 'Missing required fields.' });
         }
+        if (password.length < PASSWORD_MIN_LENGTH) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        }
+        if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_BYTES) {
+            return res.status(400).json({ error: 'Password must be at most 72 bytes.' });
+        }
 
-        const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+        const existing = await pool.query('SELECT id FROM users WHERE lower(email) = $1', [email]);
         if (existing.rows.length > 0) {
             return res.status(409).json({ error: 'Email already registered.' });
         }
@@ -216,26 +312,25 @@ app.post('/api/auth/register', async (req, res) => {
             `INSERT INTO users (email, password_hash, role, full_name, student_number)
              VALUES ($1, $2, 'student', $3, $4)
              RETURNING id, email, full_name, student_number`,
-            [email, hashedPassword, full_name, student_number]
+            [email, hashedPassword, fullName, studentNumber]
         );
 
         const user = newUser.rows[0];
-        const token = jwt.sign(
-            { id: user.id, email: user.email, role: 'student' },
-            JWT_SECRET,
-            { expiresIn: '7d' }
-        );
+        const token = signAuthToken({ id: user.id, email: user.email, role: 'student' });
 
         res.status(201).json({ message: 'Registered successfully!', user, token });
 
     } catch (error) {
+        if (error && error.code === '23505') {
+            return res.status(409).json({ error: 'Email already registered.' });
+        }
         console.error(error);
         res.status(500).json({ error: 'Internal server error.' });
     }
 });
 
 // ---------- STEP 2: DECLARATION ----------
-app.post('/api/checkin/declaration', verifyToken, async (req, res) => {
+app.post('/api/checkin/declaration', verifyToken, verifyStudent, async (req, res) => {
     try {
         const { declared_registration, declared_residence } = req.body;
         const userId = req.user.id;
@@ -259,7 +354,7 @@ app.post('/api/checkin/declaration', verifyToken, async (req, res) => {
 });
 
 // ---------- STEP 3: UPLOAD PDF ----------
-app.post('/api/checkin/upload', verifyToken, upload.single('proof'), async (req, res) => {
+app.post('/api/checkin/upload', verifyToken, verifyStudent, upload.single('proof'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
@@ -299,7 +394,7 @@ app.post('/api/checkin/upload', verifyToken, upload.single('proof'), async (req,
 });
 
 // ---------- STEP 4: VIEW ROOMS ----------
-app.get('/api/rooms', verifyToken, async (req, res) => {
+app.get('/api/rooms', verifyToken, verifyStudent, async (req, res) => {
     try {
         const userId = req.user.id;
         const userResult = await pool.query('SELECT campus_id FROM users WHERE id = $1', [userId]);
@@ -341,7 +436,7 @@ app.get('/api/rooms', verifyToken, async (req, res) => {
 });
 
 // ---------- STEP 5: RESERVE ROOM ----------
-app.post('/api/rooms/reserve', verifyToken, async (req, res) => {
+app.post('/api/rooms/reserve', verifyToken, verifyStudent, async (req, res) => {
     const client = await pool.connect();
     let inTransaction = false;
     try {
