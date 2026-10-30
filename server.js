@@ -220,8 +220,8 @@ app.get('/api/test-db', async (req, res) => {
     }
 });
 
-// ---------- GET ALL USERS ----------
-app.get('/api/users', async (req, res) => {
+// ---------- GET ALL USERS (staff only; student PII) ----------
+app.get('/api/users', verifyToken, verifyStaff, async (req, res) => {
     try {
         const result = await pool.query('SELECT id, email, full_name, role, campus_id FROM users');
         res.json({ success: true, users: result.rows });
@@ -675,7 +675,12 @@ app.get('/', (req, res) => {
     res.json({ message: 'CPUT Housing Portal API is running!' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Uploads directory: ${path.resolve(uploadDir)}`);
-});
+module.exports = app;
+module.exports.pool = pool;
+
+if (require.main === module) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+        console.log(`Uploads directory: ${path.resolve(uploadDir)}`);
+    });
+}
