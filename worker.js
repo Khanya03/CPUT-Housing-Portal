@@ -82,10 +82,11 @@ async function releaseExpiredBookings() {
     }
 }
 
-// Run once immediately
-releaseExpiredBookings();
+module.exports = { releaseExpiredBookings, pool };
 
-// Then every 5 minutes
-setInterval(releaseExpiredBookings, 5 * 60 * 1000);
-
-console.log(`[${new Date().toISOString()}] Worker started. Checking every 5 minutes.`);
+if (require.main === module) {
+    // Run once immediately, then every 5 minutes.
+    releaseExpiredBookings();
+    setInterval(releaseExpiredBookings, 5 * 60 * 1000);
+    console.log(`[${new Date().toISOString()}] Worker started. Checking every 5 minutes.`);
+}

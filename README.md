@@ -57,7 +57,7 @@ By the time the student walks into the residence, the only remaining step is a q
 | Password Hashing | bcrypt |
 | Environment Variables | dotenv |
 | Process Manager | PM2 (recommended for production) |
-| Testing | Thunder Client (VS Code extension) |
+| Testing | node:test + supertest (`npm test`), Thunder Client |
 
 ---
 
@@ -102,11 +102,10 @@ npm install -D nodemon
 psql -U postgres -c "CREATE DATABASE cput_housing;"
 ```
 
-**Run the schema** (copy from `/schema.sql`). The schema creates 6 tables: `users`, `campuses`, `residences`, `rooms`, `documents`, `bookings`.
+**Run the schema** (`schema.sql`). It creates 6 tables: `users`, `campuses`, `residences`, `rooms`, `documents`, and `bookings`, including `declared_registration`, `declared_residence`, and `campus_id` on `users`.
 
-```sql
-\c cput_housing;
--- Paste the full schema SQL here (provided separately)
+```bash
+psql -U postgres -d cput_housing -f schema.sql
 ```
 
 **Insert sample data:**
@@ -134,14 +133,6 @@ INSERT INTO rooms (residence_id, room_number, floor, status) VALUES
 (3, '203', 2, 'available'),
 (3, '204', 2, 'available'),
 (3, '205', 2, 'available');
-```
-
-**Add declaration columns:**
-
-```sql
-ALTER TABLE users ADD COLUMN declared_registration BOOLEAN DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN declared_residence BOOLEAN DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN campus_id INTEGER REFERENCES campuses(id);
 ```
 
 ### 5. Create the `.env` file
@@ -231,7 +222,7 @@ Uploads directory: C:\...\cput-housing-backend\uploads
 | Method | Endpoint | Description | Auth Required |
 |---|---|---|---|
 | `GET` | `/api/test-db` | Test database connection | ❌ |
-| `GET` | `/api/users` | View all users | ❌ |
+| `GET` | `/api/users` | View all users | ✅ Staff |
 | `GET` | `/` | API status | ❌ |
 
 ---
@@ -422,6 +413,14 @@ node worker.js
 
 ---
 
+## 🧪 Automated tests
+
+```bash
+npm test
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs this on pushes to `main` and on pull requests, against a PostgreSQL service. Locally the suite defaults to database `cput_housing_test` and refuses to reset a database whose name does not end in `_test`.
+
 ## 🧪 Testing the Full Flow
 
 Step-by-step test:
@@ -443,7 +442,11 @@ Step-by-step test:
 cput-housing-backend/
 ├── server.js              # Main API (all 7 steps + login)
 ├── worker.js              # 72-hour background worker
-├── .env                   # Environment variables
+├── schema.sql             # PostgreSQL schema
+├── tests/api.test.js      # Integration tests (npm test)
+├── .github/workflows/ci.yml
+├── .env                   # Environment variables (not committed)
+├── .env.example           # Environment variable template
 ├── package.json           # Dependencies and scripts
 ├── package-lock.json      # Locked dependencies
 ├── uploads/               # PDF storage folder
