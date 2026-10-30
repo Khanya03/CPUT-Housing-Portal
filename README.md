@@ -137,16 +137,19 @@ INSERT INTO rooms (residence_id, room_number, floor, status) VALUES
 
 ### 5. Create the `.env` file
 
-Create a `.env` file in the project root:
+Copy `.env.example` to `.env` in the project root and fill in local values. Never commit `.env`. The values below are placeholders only. For any real deploy, generate a fresh `JWT_SECRET` of at least 64 random characters, and rotate `DB_PASSWORD` and `JWT_SECRET` if they were ever committed.
 
 ```env
+# Copy this file to .env. Never commit .env.
+# For any real deploy, generate a fresh JWT_SECRET of at least 64 random characters.
+# Rotate DB_PASSWORD and JWT_SECRET if they were ever committed.
 PORT=3000
-DB_USER=postgres
+DB_USER=your_db_user
 DB_HOST=localhost
-DB_NAME=cput_housing
-DB_PASSWORD=your_password
+DB_NAME=your_db_name
+DB_PASSWORD=your_db_password
 DB_PORT=5432
-JWT_SECRET=your-super-secret-jwt-key-change-me
+JWT_SECRET=replace-with-a-long-random-secret-at-least-64-chars
 ```
 
 ### 6. Create the uploads folder
