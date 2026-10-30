@@ -14,6 +14,48 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+
+const BOOKING_TOKEN_BYTES = 16;
+const BOOKING_TOKEN_ATTEMPTS = 5;
+
+function generateBookingToken() {
+    return `CPUT-${crypto.randomBytes(BOOKING_TOKEN_BYTES).toString('hex')}`;
+}
+
+function isBookingTokenConflict(error) {
+    if (!error || error.code !== '23505') return false;
+    const haystack = `${error.constraint || ''} ${error.column || ''} ${error.detail || ''}`.toLowerCase();
+    return haystack.includes('token');
+}
+
+// Pre-check uniqueness, then insert. A unique violation aborts the surrounding
+// transaction, so retries roll back only to a savepoint.
+async function insertBookingWithUniqueToken(client, { userId, roomId, expiresAt }) {
+    for (let attempt = 1; attempt <= BOOKING_TOKEN_ATTEMPTS; attempt++) {
+        const token = generateBookingToken();
+        const clash = await client.query('SELECT 1 FROM bookings WHERE token = $1', [token]);
+        if (clash.rows.length > 0) continue;
+
+        await client.query('SAVEPOINT booking_token_insert');
+        try {
+            const bookingResult = await client.query(
+                `INSERT INTO bookings (student_id, room_id, token, status, expires_at)
+                 VALUES ($1, $2, $3, 'pending', $4)
+                 RETURNING id, token, status, created_at, expires_at`,
+                [userId, roomId, token, expiresAt]
+            );
+            await client.query('RELEASE SAVEPOINT booking_token_insert');
+            return bookingResult;
+        } catch (error) {
+            await client.query('ROLLBACK TO SAVEPOINT booking_token_insert');
+            if (isBookingTokenConflict(error) && attempt < BOOKING_TOKEN_ATTEMPTS) continue;
+            throw error;
+        }
+    }
+
+    throw new Error('Could not allocate a unique booking token.');
+}
 
 // ---------- CREATE UPLOADS FOLDER ----------
 const uploadDir = './uploads';
@@ -301,46 +343,75 @@ app.get('/api/rooms', verifyToken, async (req, res) => {
 // ---------- STEP 5: RESERVE ROOM ----------
 app.post('/api/rooms/reserve', verifyToken, async (req, res) => {
     const client = await pool.connect();
+    let inTransaction = false;
     try {
         const { room_id } = req.body;
         const userId = req.user.id;
 
         if (!room_id) return res.status(400).json({ error: 'room_id required.' });
 
+        await client.query('BEGIN');
+        inTransaction = true;
+
+        // Lock the student row first so two reserves with no booking row yet
+        // cannot both pass the "already booked" check. FOR UPDATE on bookings
+        // does not lock anything when that SELECT returns zero rows.
+        const userLock = await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+        if (userLock.rows.length === 0) {
+            await client.query('ROLLBACK');
+            inTransaction = false;
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
         const existing = await client.query(
-            'SELECT id FROM bookings WHERE student_id = $1 AND status IN ($2, $3)',
-            [userId, 'pending', 'confirmed']
+            `SELECT id FROM bookings
+             WHERE student_id = $1 AND status IN ('pending', 'confirmed')
+             FOR UPDATE`,
+            [userId]
         );
         if (existing.rows.length > 0) {
+            await client.query('ROLLBACK');
+            inTransaction = false;
             return res.status(400).json({ error: 'You already have an active booking.' });
         }
 
-        await client.query('BEGIN');
-        const roomResult = await client.query('SELECT id, room_number, status FROM rooms WHERE id = $1 FOR UPDATE', [room_id]);
+        const roomResult = await client.query(
+            'SELECT id, room_number, status FROM rooms WHERE id = $1 FOR UPDATE',
+            [room_id]
+        );
 
         if (roomResult.rows.length === 0) {
             await client.query('ROLLBACK');
+            inTransaction = false;
             return res.status(404).json({ error: 'Room not found.' });
         }
 
         const room = roomResult.rows[0];
         if (room.status !== 'available') {
             await client.query('ROLLBACK');
+            inTransaction = false;
             return res.status(400).json({ error: `Room ${room.room_number} is not available.` });
         }
 
-        const token = `CPUT-${String(Math.floor(100000 + Math.random() * 900000))}`;
         const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
+        const bookingResult = await insertBookingWithUniqueToken(client, {
+            userId,
+            roomId: room_id,
+            expiresAt
+        });
 
-        const bookingResult = await client.query(
-            `INSERT INTO bookings (student_id, room_id, token, status, expires_at)
-             VALUES ($1, $2, $3, 'pending', $4)
-             RETURNING id, token, status, created_at, expires_at`,
-            [userId, room_id, token, expiresAt]
+        const reserved = await client.query(
+            `UPDATE rooms SET status = 'reserved' WHERE id = $1 AND status = 'available'`,
+            [room_id]
         );
+        if (reserved.rowCount === 0) {
+            await client.query('ROLLBACK');
+            inTransaction = false;
+            return res.status(400).json({ error: `Room ${room.room_number} is not available.` });
+        }
 
-        await client.query('UPDATE rooms SET status = $1 WHERE id = $2', ['reserved', room_id]);
         await client.query('COMMIT');
+        inTransaction = false;
 
         res.status(201).json({
             success: true,
@@ -350,7 +421,11 @@ app.post('/api/rooms/reserve', verifyToken, async (req, res) => {
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        if (inTransaction) {
+            try { await client.query('ROLLBACK'); } catch (rollbackError) {
+                console.error(rollbackError);
+            }
+        }
         console.error(error);
         res.status(500).json({ error: 'Reservation failed.' });
     } finally {
@@ -361,6 +436,7 @@ app.post('/api/rooms/reserve', verifyToken, async (req, res) => {
 // ---------- STEP 7: STAFF CHECK-IN (TOKEN VERIFICATION) ----------
 app.post('/api/staff/verify', verifyToken, verifyStaff, async (req, res) => {
     const client = await pool.connect();
+    let inTransaction = false;
     try {
         const { token } = req.body;
 
@@ -368,67 +444,96 @@ app.post('/api/staff/verify', verifyToken, verifyStaff, async (req, res) => {
             return res.status(400).json({ error: 'Token is required.' });
         }
 
-        // 1. Find the booking with the provided token
+        await client.query('BEGIN');
+        inTransaction = true;
+
+        // Lock only the booking row. Locking the joined user/room here would
+        // invert the reserve lock order (user -> booking -> room) and deadlock.
         const bookingResult = await client.query(
-            `SELECT b.id, b.status, b.expires_at, b.room_id, 
+            `SELECT b.id, b.status, b.expires_at, b.room_id,
                     u.id AS student_id, u.full_name, u.student_number, u.email,
                     r.room_number, res.name AS residence_name
              FROM bookings b
              JOIN users u ON b.student_id = u.id
              JOIN rooms r ON b.room_id = r.id
              JOIN residences res ON r.residence_id = res.id
-             WHERE b.token = $1`,
+             WHERE b.token = $1
+             FOR UPDATE OF b`,
             [token]
         );
 
         if (bookingResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            inTransaction = false;
             return res.status(404).json({ error: 'Invalid token. No booking found.' });
         }
 
         const booking = bookingResult.rows[0];
 
-        // 2. Check if booking is already confirmed
         if (booking.status === 'confirmed') {
+            await client.query('ROLLBACK');
+            inTransaction = false;
             return res.status(400).json({ error: 'This booking has already been checked in.' });
         }
 
-        // 3. Check if booking is expired
         if (booking.status === 'expired') {
+            await client.query('ROLLBACK');
+            inTransaction = false;
             return res.status(400).json({ error: 'This booking has expired. Please re-book.' });
         }
 
-        // 4. Check if the 72-hour window has passed
+        if (booking.status !== 'pending') {
+            await client.query('ROLLBACK');
+            inTransaction = false;
+            return res.status(409).json({ error: 'Booking can no longer be verified.' });
+        }
+
+        await client.query('SELECT id FROM rooms WHERE id = $1 FOR UPDATE', [booking.room_id]);
+
         const now = new Date();
         const expiresAt = new Date(booking.expires_at);
         if (now > expiresAt) {
-            // Auto-expire it
-            await client.query(
-                `UPDATE bookings SET status = 'expired' WHERE id = $1`,
+            const expired = await client.query(
+                `UPDATE bookings SET status = 'expired' WHERE id = $1 AND status = 'pending' RETURNING id`,
                 [booking.id]
             );
-            await client.query(
-                `UPDATE rooms SET status = 'available' WHERE id = $1`,
-                [booking.room_id]
-            );
+            if (expired.rowCount > 0) {
+                await client.query(
+                    `UPDATE rooms SET status = 'available' WHERE id = $1 AND status = 'reserved'`,
+                    [booking.room_id]
+                );
+            }
+            await client.query('COMMIT');
+            inTransaction = false;
             return res.status(400).json({ error: 'Token expired. Room has been released.' });
         }
 
-        // 5. Valid token! Perform check-in
-        await client.query('BEGIN');
-
-        // Update booking status to 'confirmed'
-        await client.query(
-            `UPDATE bookings SET status = 'confirmed', checked_in_at = NOW() WHERE id = $1`,
+        const confirmed = await client.query(
+            `UPDATE bookings SET status = 'confirmed', checked_in_at = NOW()
+             WHERE id = $1 AND status = 'pending'
+             RETURNING id`,
             [booking.id]
         );
+        if (confirmed.rowCount === 0) {
+            await client.query('ROLLBACK');
+            inTransaction = false;
+            return res.status(409).json({ error: 'Booking is no longer pending and cannot be checked in.' });
+        }
 
-        // Update room status to 'occupied'
-        await client.query(
-            `UPDATE rooms SET status = 'occupied' WHERE id = $1`,
+        // Do not confirm a booking whose room is not still reserved. Rolling
+        // back leaves neither a confirmed booking nor a freed/occupied mismatch.
+        const occupied = await client.query(
+            `UPDATE rooms SET status = 'occupied' WHERE id = $1 AND status = 'reserved' RETURNING id`,
             [booking.room_id]
         );
+        if (occupied.rowCount === 0) {
+            await client.query('ROLLBACK');
+            inTransaction = false;
+            return res.status(409).json({ error: 'Room is not reserved for this booking. Check-in was not applied.' });
+        }
 
         await client.query('COMMIT');
+        inTransaction = false;
 
         res.json({
             success: true,
@@ -446,7 +551,11 @@ app.post('/api/staff/verify', verifyToken, verifyStaff, async (req, res) => {
         });
 
     } catch (error) {
-        await client.query('ROLLBACK');
+        if (inTransaction) {
+            try { await client.query('ROLLBACK'); } catch (rollbackError) {
+                console.error(rollbackError);
+            }
+        }
         console.error('Verification error:', error);
         res.status(500).json({ error: 'Internal server error during verification.' });
     } finally {
