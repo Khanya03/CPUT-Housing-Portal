@@ -36,7 +36,7 @@ By the time the student walks into the residence, the only remaining step is a q
 
 | # | Feature | Description |
 |---|---------|-------------|
-| 1 | **Student Registration** | Only `@mycput.ac.za` emails allowed. Passwords securely hashed with bcrypt. |
+| 1 | **Student Registration** | Only `@mycput.ac.za` emails allowed (matched case-insensitively and stored lowercase). Passwords must be at least 8 characters and are hashed with bcrypt. |
 | 2 | **Dual-Checkbox Declaration** | Students must confirm both registration **and** residence allocation before proceeding. |
 | 3 | **PDF Document Upload** | 8MB limit, binary validation (magic bytes) to prevent spoofed files. |
 | 4 | **Color-Coded Room Grid** | 🟢 Green = Available · 🟡 Amber = Reserved · ⚪ Slate = Occupied. Campus-bound viewing. |
@@ -460,7 +460,7 @@ cput-housing-backend/
 |---|---|
 | `psql: command not found` | Add PostgreSQL to PATH: `set PATH=%PATH%;C:\Program Files\PostgreSQL\18\bin` |
 | `Access denied. No token provided.` | Add `Authorization: Bearer <token>` header |
-| `Access denied. Staff privileges required.` | Login as staff and use a fresh token (role is embedded in the JWT) |
+| `Access denied. Staff privileges required.` | Login as staff. The token is checked against the account still in the database, and the account role must be staff. |
 | Token expired | Re-book a room or wait for the worker to release it |
 | `403 Forbidden` on localhost | Try port `3000` instead of `5000`, or use `127.0.0.1` |
 | `Only @mycput.ac.za emails allowed` | Registration is student-only. Create staff by promoting a student in the DB. |
