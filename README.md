@@ -19,6 +19,7 @@ A comprehensive student self-check-in system for CPUT residences, built with **N
 - [Project Structure](#-project-structure)
 - [Troubleshooting](#-troubleshooting)
 - [Next Steps](#-next-steps)
+- [Security](#-security)
 - [License](#-license)
 - [Acknowledgments](#-acknowledgments)
 
@@ -537,6 +538,12 @@ pm2 startup
 - Room swap requests
 - Student profile management
 - Admin dashboard
+
+---
+
+## 🔒 Security
+
+See our [security write-up](docs/security-credential-rotation.md) for how we handle credentials and rotation. Copy `.env.example` to a local `.env` and never commit `.env`.
 
 ---
 
